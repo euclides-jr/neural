@@ -1,0 +1,5 @@
+[build]
+# Tune for the exact CPU this binary runs on — enables AVX2/NEON SIMD
+# that NAM's matrix math relies on heavily.
+# This is the stable equivalent of profile-level rustflags.
+rustflags = ["-C", "target-cpu=native"]

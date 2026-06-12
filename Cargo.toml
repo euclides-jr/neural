@@ -6,3 +6,16 @@ edition = "2024"
 [dependencies]
 cpal = "0.18.1"
 nam-rs = "0.3.0"
+ringbuf = "0.4"
+libc = "0.2"
+dbus = "0.9"
+
+[profile.release]
+# Enable Link-Time Optimization (LTO) for cross-crate optimization and inlining.
+lto = true
+# Single codegen unit so the compiler sees the whole program at once.
+codegen-units = 1
+# Strip debug symbols to reduce binary size.
+strip = "debuginfo"
+# Abort on panic to remove unwinding tables and code overhead.
+panic = "abort"
