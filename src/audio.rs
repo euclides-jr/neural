@@ -7,6 +7,8 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use crate::BUFFER_SIZE;
 
+const DELAY_BUF_SIZE: usize = 96000; // 2 seconds of delay memory at 48 kHz
+
 // ── Device selection ──────────────────────────────────────────────────────────
 
 pub fn find_usb_device(host: &cpal::Host) -> Option<cpal::Device> {
@@ -100,6 +102,10 @@ pub fn build_output_stream(
     bypass: Arc<AtomicBool>,
     gate_enabled: Arc<AtomicBool>,
     gate_threshold_db: Arc<AtomicU32>,
+    delay_enabled: Arc<AtomicBool>,
+    delay_time_ms: Arc<AtomicU32>,
+    delay_feedback: Arc<AtomicU32>,
+    delay_mix: Arc<AtomicU32>,
 ) -> Result<cpal::Stream, Box<dyn std::error::Error>> {
     fn build_stream<T>(
         device: &cpal::Device,
@@ -111,6 +117,10 @@ pub fn build_output_stream(
         bypass: Arc<AtomicBool>,
         gate_enabled: Arc<AtomicBool>,
         gate_threshold_db: Arc<AtomicU32>,
+        delay_enabled: Arc<AtomicBool>,
+        delay_time_ms: Arc<AtomicU32>,
+        delay_feedback: Arc<AtomicU32>,
+        delay_mix: Arc<AtomicU32>,
         err_fn: impl Fn(cpal::Error) + Send + 'static,
     ) -> Result<cpal::Stream, Box<dyn std::error::Error>>
     where
@@ -119,6 +129,10 @@ pub fn build_output_stream(
         let mut mono: Vec<f32> = vec![0.0; BUFFER_SIZE as usize * 8];
         let mut gate_gain = 0.0f32;
         let sr = config.sample_rate as f32;
+
+        // Preallocate static delay line buffers (to be moved into callback closure)
+        let mut delay_buffer = vec![0.0f32; DELAY_BUF_SIZE];
+        let mut delay_write_idx = 0;
 
         let stream = device.build_output_stream(
             config.clone(),
@@ -166,6 +180,34 @@ pub fn build_output_stream(
                     }
                 }
 
+                // 2b. Apply Delay Effect after NAM model (guitar style delay chain)
+                if delay_enabled.load(Ordering::Relaxed) {
+                    let time_ms = delay_time_ms.load(Ordering::Relaxed) as f32;
+                    let feedback = f32::from_bits(delay_feedback.load(Ordering::Relaxed));
+                    let mix = f32::from_bits(delay_mix.load(Ordering::Relaxed));
+                    
+                    let delay_samples = ((time_ms * 0.001) * sr).round() as usize;
+
+                    for sample in mono_slice.iter_mut() {
+                        let read_idx = if delay_write_idx >= delay_samples {
+                            delay_write_idx - delay_samples
+                        } else {
+                            delay_write_idx + DELAY_BUF_SIZE - delay_samples
+                        };
+                        
+                        let wet = delay_buffer[read_idx];
+                        let dry = *sample;
+                        
+                        // Feedback current dry signal + wet history back into the loop
+                        delay_buffer[delay_write_idx] = dry + wet * feedback;
+                        
+                        // Mix final sample (combining dry and wet parts)
+                        *sample = dry * (1.0 - mix) + wet * mix;
+                        
+                        delay_write_idx = (delay_write_idx + 1) % DELAY_BUF_SIZE;
+                    }
+                }
+
                 // Compute peak amplitude for level meter
                 let mut max_val = 0.0f32;
                 for &sample in mono_slice.iter() {
@@ -190,16 +232,16 @@ pub fn build_output_stream(
 
     let err_fn = |err| eprintln!("Output stream error: {err}");
     Ok(match format {
-        cpal::SampleFormat::I8  => build_stream::<i8> (device, config, channels, Arc::clone(&active_model), cons, output_level, bypass, Arc::clone(&gate_enabled), Arc::clone(&gate_threshold_db), err_fn)?,
-        cpal::SampleFormat::I16 => build_stream::<i16>(device, config, channels, Arc::clone(&active_model), cons, output_level, bypass, Arc::clone(&gate_enabled), Arc::clone(&gate_threshold_db), err_fn)?,
-        cpal::SampleFormat::I32 => build_stream::<i32>(device, config, channels, Arc::clone(&active_model), cons, output_level, bypass, Arc::clone(&gate_enabled), Arc::clone(&gate_threshold_db), err_fn)?,
-        cpal::SampleFormat::I64 => build_stream::<i64>(device, config, channels, Arc::clone(&active_model), cons, output_level, bypass, Arc::clone(&gate_enabled), Arc::clone(&gate_threshold_db), err_fn)?,
-        cpal::SampleFormat::U8  => build_stream::<u8> (device, config, channels, Arc::clone(&active_model), cons, output_level, bypass, Arc::clone(&gate_enabled), Arc::clone(&gate_threshold_db), err_fn)?,
-        cpal::SampleFormat::U16 => build_stream::<u16>(device, config, channels, Arc::clone(&active_model), cons, output_level, bypass, Arc::clone(&gate_enabled), Arc::clone(&gate_threshold_db), err_fn)?,
-        cpal::SampleFormat::U32 => build_stream::<u32>(device, config, channels, Arc::clone(&active_model), cons, output_level, bypass, Arc::clone(&gate_enabled), Arc::clone(&gate_threshold_db), err_fn)?,
-        cpal::SampleFormat::U64 => build_stream::<u64>(device, config, channels, Arc::clone(&active_model), cons, output_level, bypass, Arc::clone(&gate_enabled), Arc::clone(&gate_threshold_db), err_fn)?,
-        cpal::SampleFormat::F32 => build_stream::<f32>(device, config, channels, Arc::clone(&active_model), cons, output_level, bypass, Arc::clone(&gate_enabled), Arc::clone(&gate_threshold_db), err_fn)?,
-        cpal::SampleFormat::F64 => build_stream::<f64>(device, config, channels, Arc::clone(&active_model), cons, output_level, bypass, Arc::clone(&gate_enabled), Arc::clone(&gate_threshold_db), err_fn)?,
+        cpal::SampleFormat::I8  => build_stream::<i8> (device, config, channels, Arc::clone(&active_model), cons, output_level, bypass, Arc::clone(&gate_enabled), Arc::clone(&gate_threshold_db), Arc::clone(&delay_enabled), Arc::clone(&delay_time_ms), Arc::clone(&delay_feedback), Arc::clone(&delay_mix), err_fn)?,
+        cpal::SampleFormat::I16 => build_stream::<i16>(device, config, channels, Arc::clone(&active_model), cons, output_level, bypass, Arc::clone(&gate_enabled), Arc::clone(&gate_threshold_db), Arc::clone(&delay_enabled), Arc::clone(&delay_time_ms), Arc::clone(&delay_feedback), Arc::clone(&delay_mix), err_fn)?,
+        cpal::SampleFormat::I32 => build_stream::<i32>(device, config, channels, Arc::clone(&active_model), cons, output_level, bypass, Arc::clone(&gate_enabled), Arc::clone(&gate_threshold_db), Arc::clone(&delay_enabled), Arc::clone(&delay_time_ms), Arc::clone(&delay_feedback), Arc::clone(&delay_mix), err_fn)?,
+        cpal::SampleFormat::I64 => build_stream::<i64>(device, config, channels, Arc::clone(&active_model), cons, output_level, bypass, Arc::clone(&gate_enabled), Arc::clone(&gate_threshold_db), Arc::clone(&delay_enabled), Arc::clone(&delay_time_ms), Arc::clone(&delay_feedback), Arc::clone(&delay_mix), err_fn)?,
+        cpal::SampleFormat::U8  => build_stream::<u8> (device, config, channels, Arc::clone(&active_model), cons, output_level, bypass, Arc::clone(&gate_enabled), Arc::clone(&gate_threshold_db), Arc::clone(&delay_enabled), Arc::clone(&delay_time_ms), Arc::clone(&delay_feedback), Arc::clone(&delay_mix), err_fn)?,
+        cpal::SampleFormat::U16 => build_stream::<u16>(device, config, channels, Arc::clone(&active_model), cons, output_level, bypass, Arc::clone(&gate_enabled), Arc::clone(&gate_threshold_db), Arc::clone(&delay_enabled), Arc::clone(&delay_time_ms), Arc::clone(&delay_feedback), Arc::clone(&delay_mix), err_fn)?,
+        cpal::SampleFormat::U32 => build_stream::<u32>(device, config, channels, Arc::clone(&active_model), cons, output_level, bypass, Arc::clone(&gate_enabled), Arc::clone(&gate_threshold_db), Arc::clone(&delay_enabled), Arc::clone(&delay_time_ms), Arc::clone(&delay_feedback), Arc::clone(&delay_mix), err_fn)?,
+        cpal::SampleFormat::U64 => build_stream::<u64>(device, config, channels, Arc::clone(&active_model), cons, output_level, bypass, Arc::clone(&gate_enabled), Arc::clone(&gate_threshold_db), Arc::clone(&delay_enabled), Arc::clone(&delay_time_ms), Arc::clone(&delay_feedback), Arc::clone(&delay_mix), err_fn)?,
+        cpal::SampleFormat::F32 => build_stream::<f32>(device, config, channels, Arc::clone(&active_model), cons, output_level, bypass, Arc::clone(&gate_enabled), Arc::clone(&gate_threshold_db), Arc::clone(&delay_enabled), Arc::clone(&delay_time_ms), Arc::clone(&delay_feedback), Arc::clone(&delay_mix), err_fn)?,
+        cpal::SampleFormat::F64 => build_stream::<f64>(device, config, channels, Arc::clone(&active_model), cons, output_level, bypass, Arc::clone(&gate_enabled), Arc::clone(&gate_threshold_db), Arc::clone(&delay_enabled), Arc::clone(&delay_time_ms), Arc::clone(&delay_feedback), Arc::clone(&delay_mix), err_fn)?,
         _ => return Err(format!("Unsupported output format: {format:?}").into()),
     })
 }

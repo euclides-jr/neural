@@ -139,6 +139,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let bypass = Arc::new(AtomicBool::new(false));
     let gate_enabled = Arc::new(AtomicBool::new(true));
     let gate_threshold_db = Arc::new(AtomicU32::new((-45.0f32).to_bits()));
+    
+    // Shared states for delay effect parameters
+    let delay_enabled = Arc::new(AtomicBool::new(false));
+    let delay_time_ms = Arc::new(AtomicU32::new(350));
+    let delay_feedback = Arc::new(AtomicU32::new((0.4f32).to_bits()));
+    let delay_mix = Arc::new(AtomicU32::new((0.3f32).to_bits()));
+
     let active_model = Arc::new(Mutex::new(amp));
 
     // ── Lock-free capture ring ────────────────────────────────────────────────
@@ -166,6 +173,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         Arc::clone(&bypass),
         Arc::clone(&gate_enabled),
         Arc::clone(&gate_threshold_db),
+        Arc::clone(&delay_enabled),
+        Arc::clone(&delay_time_ms),
+        Arc::clone(&delay_feedback),
+        Arc::clone(&delay_mix),
     )?;
 
     input_stream.play()?;
@@ -210,10 +221,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         bypass,
         gate_enabled,
         gate_threshold_db,
+        delay_enabled,
+        delay_time_ms,
+        delay_feedback,
+        delay_mix,
         picker_mode: false,
         browser_dir,
         browser_items,
         browser_selected: 0,
+        effects_mode: false,
+        effects_selected: 0,
         active_model,
         logs,
     };
@@ -302,6 +319,71 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                             }
                             _ => {}
                         }
+                    } else if tui_app.effects_mode {
+                        match key.code {
+                            KeyCode::Char('q') | KeyCode::Esc | KeyCode::Char('e') | KeyCode::Char('E') => {
+                                tui_app.effects_mode = false;
+                            }
+                            KeyCode::Char('k') | KeyCode::Char('K') | KeyCode::Up => {
+                                if tui_app.effects_selected > 0 {
+                                    tui_app.effects_selected -= 1;
+                                } else {
+                                    tui_app.effects_selected = 3;
+                                }
+                            }
+                            KeyCode::Char('j') | KeyCode::Char('J') | KeyCode::Down => {
+                                tui_app.effects_selected = (tui_app.effects_selected + 1) % 4;
+                            }
+                            KeyCode::Enter | KeyCode::Char(' ') => {
+                                if tui_app.effects_selected == 0 {
+                                    let prev = tui_app.delay_enabled.load(Ordering::Relaxed);
+                                    tui_app.delay_enabled.store(!prev, Ordering::Relaxed);
+                                    let status_str = if !prev { "Enabled Delay Effect" } else { "Disabled Delay Effect" };
+                                    tui_app.logs.push(format!("Effects Action: {}", status_str));
+                                }
+                            }
+                            KeyCode::Left | KeyCode::Char('h') | KeyCode::Char('H') => {
+                                match tui_app.effects_selected {
+                                    1 => {
+                                        let prev = tui_app.delay_time_ms.load(Ordering::Relaxed);
+                                        let next = prev.saturating_sub(50).max(50);
+                                        tui_app.delay_time_ms.store(next, Ordering::Relaxed);
+                                    }
+                                    2 => {
+                                        let prev = f32::from_bits(tui_app.delay_feedback.load(Ordering::Relaxed));
+                                        let next = (prev - 0.05).max(0.0);
+                                        tui_app.delay_feedback.store(next.to_bits(), Ordering::Relaxed);
+                                    }
+                                    3 => {
+                                        let prev = f32::from_bits(tui_app.delay_mix.load(Ordering::Relaxed));
+                                        let next = (prev - 0.05).max(0.0);
+                                        tui_app.delay_mix.store(next.to_bits(), Ordering::Relaxed);
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            KeyCode::Right | KeyCode::Char('l') | KeyCode::Char('L') => {
+                                match tui_app.effects_selected {
+                                    1 => {
+                                        let prev = tui_app.delay_time_ms.load(Ordering::Relaxed);
+                                        let next = (prev + 50).min(2000);
+                                        tui_app.delay_time_ms.store(next, Ordering::Relaxed);
+                                    }
+                                    2 => {
+                                        let prev = f32::from_bits(tui_app.delay_feedback.load(Ordering::Relaxed));
+                                        let next = (prev + 0.05).min(0.95);
+                                        tui_app.delay_feedback.store(next.to_bits(), Ordering::Relaxed);
+                                    }
+                                    3 => {
+                                        let prev = f32::from_bits(tui_app.delay_mix.load(Ordering::Relaxed));
+                                        let next = (prev + 0.05).min(1.0);
+                                        tui_app.delay_mix.store(next.to_bits(), Ordering::Relaxed);
+                                    }
+                                    _ => {}
+                                }
+                            }
+                            _ => {}
+                        }
                     } else {
                         match key.code {
                             KeyCode::Char('q') | KeyCode::Esc => {
@@ -325,6 +407,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 if let Ok(items) = read_directory(&tui_app.browser_dir) {
                                     tui_app.browser_items = items;
                                 }
+                            }
+                            KeyCode::Char('e') | KeyCode::Char('E') => {
+                                tui_app.effects_mode = true;
+                                tui_app.effects_selected = 0;
                             }
                             KeyCode::Up => {
                                 let prev_db = f32::from_bits(tui_app.gate_threshold_db.load(Ordering::Relaxed));

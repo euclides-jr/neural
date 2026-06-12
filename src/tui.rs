@@ -38,19 +38,29 @@ pub struct TuiApp {
     pub gate_enabled: Arc<AtomicBool>,
     pub gate_threshold_db: Arc<AtomicU32>,
     
+    // Delay effect states
+    pub delay_enabled: Arc<AtomicBool>,
+    pub delay_time_ms: Arc<AtomicU32>,
+    pub delay_feedback: Arc<AtomicU32>,
+    pub delay_mix: Arc<AtomicU32>,
+    
+    // File system picker state
     pub picker_mode: bool,
     pub browser_dir: PathBuf,
     pub browser_items: Vec<BrowserItem>,
     pub browser_selected: usize,
-    pub active_model: Arc<Mutex<Option<Model>>>,
     
+    // Effects modal state
+    pub effects_mode: bool,
+    pub effects_selected: usize,
+    
+    pub active_model: Arc<Mutex<Option<Model>>>,
     pub logs: Vec<String>,
 }
 
 pub fn read_directory(path: &Path) -> std::io::Result<Vec<BrowserItem>> {
     let mut items = Vec::new();
     
-    // Add parent directory option if we are not at root
     if let Some(parent) = path.parent() {
         items.push(BrowserItem {
             name: "📁 .. (Parent Directory)".to_string(),
@@ -92,7 +102,6 @@ pub fn read_directory(path: &Path) -> std::io::Result<Vec<BrowserItem>> {
         }
     }
     
-    // Sort directories and files alphabetically
     dir_items.sort_by(|a, b| a.name.cmp(&b.name));
     file_items.sort_by(|a, b| a.name.cmp(&b.name));
     
@@ -131,6 +140,8 @@ pub fn draw_tui(f: &mut ratatui::Frame, app: &TuiApp) {
             Span::raw(" Bypass | "),
             Span::styled("[M]", Style::default().fg(Color::Yellow).bold()),
             Span::raw(" Load Model | "),
+            Span::styled("[E]", Style::default().fg(Color::Yellow).bold()),
+            Span::raw(" Effects | "),
             Span::styled("[G]", Style::default().fg(Color::Yellow).bold()),
             Span::raw(" Gate | "),
             Span::styled("[Up/Dn]", Style::default().fg(Color::Yellow).bold()),
@@ -223,6 +234,21 @@ pub fn draw_tui(f: &mut ratatui::Frame, app: &TuiApp) {
         Span::raw(format!("{:.1} dBFS", thresh_db)),
     ]));
 
+    let delay_active = app.delay_enabled.load(Ordering::Relaxed);
+    let delay_status_span = if delay_active {
+        let time = app.delay_time_ms.load(Ordering::Relaxed);
+        let fb = f32::from_bits(app.delay_feedback.load(Ordering::Relaxed));
+        Span::styled(format!("ENABLED ({}ms, {:.0}% FB)", time, fb * 100.0), Style::default().fg(Color::Green).bold())
+    } else {
+        Span::styled("DISABLED", Style::default().fg(Color::DarkGray))
+    };
+
+    model_info.push(Line::from(vec![
+        Span::styled("Delay Effect:", Style::default().bold().fg(Color::Cyan)),
+        Span::raw(" "),
+        delay_status_span,
+    ]));
+
     let model_block = Paragraph::new(model_info)
         .block(Block::default().borders(Borders::ALL).title(" DSP / NAM Model ").border_style(Style::default().fg(Color::Cyan)));
     f.render_widget(model_block, info_chunks[1]);
@@ -279,9 +305,11 @@ pub fn draw_tui(f: &mut ratatui::Frame, app: &TuiApp) {
         .style(Style::default().fg(Color::Gray));
     f.render_widget(logs_list, chunks[3]);
 
-    // Render picker overlay on top
+    // Render overlays on top
     if app.picker_mode {
         draw_picker_popup(f, app);
+    } else if app.effects_mode {
+        draw_effects_popup(f, app);
     }
 }
 
@@ -340,6 +368,75 @@ fn draw_picker_popup(f: &mut ratatui::Frame, app: &TuiApp) {
     f.render_widget(list, picker_chunks[0]);
     
     let legend = Paragraph::new(" [Enter] Select/Open  |  [Up/Dn / J/K] Navigate  |  [Esc / M] Cancel ")
+        .alignment(ratatui::layout::Alignment::Center)
+        .style(Style::default().fg(Color::Yellow).bold());
+        
+    f.render_widget(legend, picker_chunks[1]);
+}
+
+fn draw_effects_popup(f: &mut ratatui::Frame, app: &TuiApp) {
+    let area = f.area();
+    
+    let popup_layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage(20),
+            Constraint::Percentage(60),
+            Constraint::Percentage(20),
+        ])
+        .split(area);
+        
+    let picker_area = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage(15),
+            Constraint::Percentage(70),
+            Constraint::Percentage(15),
+        ])
+        .split(popup_layout[1])[1];
+        
+    f.render_widget(Clear, picker_area);
+    
+    let picker_chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Min(3),
+            Constraint::Length(1),
+        ])
+        .split(picker_area);
+        
+    let delay_active = app.delay_enabled.load(Ordering::Relaxed);
+    let delay_time = app.delay_time_ms.load(Ordering::Relaxed);
+    let delay_fb = f32::from_bits(app.delay_feedback.load(Ordering::Relaxed));
+    let delay_mx = f32::from_bits(app.delay_mix.load(Ordering::Relaxed));
+    
+    let mut items = Vec::new();
+    
+    let enable_str = if delay_active { "ENABLED (Active)" } else { "DISABLED (Bypassed)" };
+    items.push((0, format!("Delay Effect:  {}", enable_str)));
+    items.push((1, format!("Delay Time:    {} ms", delay_time)));
+    items.push((2, format!("Feedback:      {:.0}%", delay_fb * 100.0)));
+    items.push((3, format!("Wet Mix:       {:.0}%", delay_mx * 100.0)));
+    
+    let items_list: Vec<ListItem> = items.iter().map(|(idx, text)| {
+        let style = if *idx == app.effects_selected {
+            Style::default().fg(Color::Black).bg(Color::Magenta).bold()
+        } else {
+            Style::default().fg(Color::White)
+        };
+        ListItem::new(text.as_str()).style(style)
+    }).collect();
+    
+    let list = List::new(items_list)
+        .block(Block::default()
+            .borders(Borders::ALL)
+            .title(Span::styled(" Delay Effect Configuration ", Style::default().fg(Color::Magenta).bold()))
+            .border_style(Style::default().fg(Color::Magenta)))
+        .style(Style::default().fg(Color::White));
+        
+    f.render_widget(list, picker_chunks[0]);
+    
+    let legend = Paragraph::new(" [Up/Dn / J/K] Select Parameter  |  [Lf/Rt / H/L] Adjust  |  [Esc / E] Close ")
         .alignment(ratatui::layout::Alignment::Center)
         .style(Style::default().fg(Color::Yellow).bold());
         
